@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/stm32f103_boot_loader.iml" filepath="$PROJECT_DIR$/.idea/stm32f103_boot_loader.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/STM32f_405_boot_loader.iml" filepath="$PROJECT_DIR$/.idea/STM32f_405_boot_loader.iml" />
     </modules>
   </component>
 </project>
