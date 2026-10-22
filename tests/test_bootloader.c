@@ -333,13 +333,57 @@ static void TestMaximumImage(void)
     puts("PASS: full 384 KiB image and partition boundaries");
 }
 
-int main(void)
+static void ReadFile(const char *path, void *buffer, size_t size)
+{
+    FILE *file = fopen(path, "rb");
+    assert(file != NULL);
+    assert(fread(buffer, 1U, size, file) == size);
+    assert(fgetc(file) == EOF);
+    assert(!ferror(file));
+    assert(fclose(file) == 0);
+}
+
+static void TestBuiltApplication(const char *image_path, const char *manifest_path)
+{
+    static uint8_t image[BOOT_IMAGE_CAPACITY];
+    BootImageManifest manifest;
+    ReadFile(manifest_path, &manifest, sizeof(manifest));
+    assert(Boot_ManifestValid(&manifest));
+    ReadFile(image_path, image, manifest.image_size);
+
+    /* Use the exact cross-compiled APP and Python-generated metadata. */
+    Setup(false);
+    memset(flash, 0xFF, sizeof(flash));
+    memcpy(At(BOOT_APP_ADDRESS), image, manifest.image_size);
+    memcpy(At(BOOT_INSTALLED_ADDRESS), &manifest, sizeof(manifest));
+    assert(Boot_PrepareApplication() == BOOT_READY);
+    assert(erases == 0U);
+
+    Setup(false);
+    memset(flash, 0xFF, sizeof(flash));
+    memcpy(At(BOOT_STAGE_ADDRESS), image, manifest.image_size);
+    memcpy(At(BOOT_REQUEST_ADDRESS), &manifest, sizeof(manifest));
+    assert(Boot_PrepareApplication() == BOOT_READY);
+    assert(Boot_ImageValid(BOOT_APP_ADDRESS, &manifest));
+    assert(memcmp(At(BOOT_APP_ADDRESS), image, manifest.image_size) == 0);
+    const unsigned before = erases;
+    assert(Boot_PrepareApplication() == BOOT_READY);
+    assert(erases == before);
+    puts("PASS: built APP boots directly and installs from staging without reinstalling on reset");
+}
+
+int main(int argc, char **argv)
 {
     TestCrcHardwareCompatibility();
     TestValidation();
     TestFailures();
     TestPowerCuts();
     TestMaximumImage();
+    assert(argc == 1 || argc == 3);
+    if (argc == 3)
+    {
+        TestBuiltApplication(argv[1], argv[2]);
+    }
     puts("PASS: CRC, vectors, metadata, corrupt image, Flash failures and protected regions");
     return 0;
 }

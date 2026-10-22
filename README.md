@@ -30,7 +30,25 @@ Bootloader 链接脚本限制为 16 KiB（`0x08000000`–`0x08003FFF`），超�
 释放出的 sector 1 暂时保留，已安装信息、升级请求、APP 和暂存区的地址均不变。
 Flash 擦写采用 32 位编程，要求板卡电源为 2.7–3.6 V。
 
-## APP 工程需要做的修改
+## 配套 APP 工程
+
+同级 `../APP` 已完成以下配置：Flash 链接地址为 `0x08020000`，容量为 384 KiB；
+`SystemInit()` 通过启动文件的 `g_pfnVectors` 设置实际 VTOR；主循环每 500 ms 翻转 LED0。
+完整构建和烧录说明见 `../APP/README.md`。
+
+在 APP 目录执行即可同时构建两个工程并生成首次烧录文件：
+
+```powershell
+cmake -S . -B build/integration-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/integration-debug --target firmware_bundle
+```
+
+产物 `../APP/build/integration-debug/firmware.factory.hex` 包含 Bootloader、
+已安装描述信息、取消旧升级请求的标记和 APP，可通过 SWD 按地址擦除、下载、校验后复位。
+普通 APP 构建会自动生成 `APP.installed.hex`（直接更新运行区）和 `APP.update.hex`
+（暂存区及升级请求，复位后由 Bootloader 安装）。两者均保留 Bootloader 区。
+
+## 其他 APP 工程的接入要求
 
 1. APP 链接脚本中的 Flash 区域设置为：
 
@@ -115,6 +133,22 @@ python -B tools/make_manifest.py app.bin --version 1 --output app.manifest.bin
 ```
 
 脚本会拒绝错误的固件大小、MSP 或链接地址。输出文件同时适用于已安装信息和新升级请求。
+地址、容量、格式和提交常量直接读取 `Core/Inc/boot_protocol.h`。
+
+也可生成自带地址的稀疏 Intel HEX；保留区不会被填充：
+
+```powershell
+python -B tools/make_manifest.py ../APP/build/integration-debug/APP.bin `
+  --version 1 --output build/app.manifest.bin `
+  --installed-hex build/app.installed.hex --update-hex build/app.update.hex `
+  --bootloader build/integration-debug/stm32f405_boot_loader.bin --factory-hex build/firmware.factory.hex
+```
+
+`installed` / `factory` 包会将 `0x0800C01C` 的 consumed 字段写为 0，
+避免遗留升级请求覆盖本次直接烧录的 APP。`update` 包保留 consumed 为擦除值，
+复位后正常执行安装。烧录这些 HEX 时保持 MCU 停止，按所含扇区擦除，
+全部下载校验完成后再复位。HEX 是 SWD 调试/装机包；在线下载仍必须遵守
+前述 commit 最后写入的顺序，不能依赖 HEX 记录顺序实现断电保护。
 
 首次装机有两种方式，写入之后复位：
 
@@ -123,7 +157,9 @@ python -B tools/make_manifest.py app.bin --version 1 --output app.manifest.bin
 - 验证安装流程：Bootloader `.elf` 写入其链接地址，APP `.bin` 写到 `0x08080000`，
   `app.manifest.bin` **最后**写到 `0x0800C000`；复位后由 Bootloader 安装。
 
-装机/升级请按扇区擦除，避免整片擦除损坏其他区域。以上为操作说明，本次开发未执行烧录。
+装机/升级请按扇区擦除，避免整片擦除损坏其他区域。
+2026-10-22 已完成实板首次装机、暂存安装、再次复位不重复安装及最终 APP 运行验证，
+详见 [实板记录](../APP/docs/hardware-validation-2026-10-22.md)。
 
 ## 编译和测试
 
@@ -152,6 +188,9 @@ $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 gcc -std=c11 -Wall -Wextra -Werror -ICore/Inc tests/test_bootloader.c Core/Src/bootloader.c -o build/test_bootloader.exe
 ./build/test_bootloader.exe
 python -B -m unittest discover -s tests -p test_manifest.py -v
+
+# 将实际交叉编译的 APP 和 Python 生成的描述信息交给生产版 Bootloader 校验/安装。
+./build/test_bootloader.exe ../APP/build/integration-debug/APP.bin ../APP/build/integration-debug/APP.manifest.bin
 ```
 
 主机模型不能替代实板验证。实板还需检查 APP 中断/时钟初始化、完整大小固件安装、
