@@ -1,0 +1,22 @@
+# Build directories and generated firmware
+/cmake-build-*/
+/build/
+/Debug/
+/Release/
+*.o
+*.obj
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.su
+
+# Local IDE state and editor preferences
+/.idea/workspace.xml
+/.idea/editor.xml
+/.idea/shelf/
+/.idea/httpRequests/
+/.idea/queries/
+/.idea/dataSources/
+/.idea/dataSources.local.xml
