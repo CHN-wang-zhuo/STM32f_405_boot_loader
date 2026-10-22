@@ -3,9 +3,9 @@
 本工程用于 STM32F405RGT6（1 MiB 内部 Flash）：**APP 下载到 W25Q16，Bootloader 校验并安装到内部 Flash，再启动 APP**。
 Bootloader 没有下载协议，也不使用 DMA/RTOS。
 
-外部格式按 `../APP/docs/w25q16-update-storage.md` 的「W25Q16 升级存储规范 v1」实现。
-该文档中“Bootloader 尚不认识外部存储”的文字描述的是 APP 文档发布时的旧版本；
-本次只修改 Bootloader 工程，APP 工程及其协议文档没有修改。
+Bootloader 与配套 APP 是两个独立项目。APP 项目见 [STM32f_405_FreeRTOS](https://github.com/CHN-wang-zhuo/STM32f_405_FreeRTOS)。
+外部存储格式遵循该 APP 项目中 `docs/w25q16-update-storage.md` 定义的「W25Q16 升级存储规范 v1」。
+APP 负责下载固件并提交升级请求，Bootloader 负责校验、安装和启动固件。
 
 ## 启动与硬件
 
