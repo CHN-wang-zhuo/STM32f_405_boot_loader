@@ -136,14 +136,18 @@ python -B tools/make_manifest.py app.bin --version 1 --output app.manifest.bin -
 ## 构建与验证
 
 ```powershell
-cmake -S . -B build/bootloader -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/bootloader
+cmake -S . -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build cmake-build-debug
 ./tests/run_tests.ps1
 ```
 
-`cmake/bootloader_sources.cmake` 显式列出需要的生产源文件。
-CLion 的 `cmake-build-debug` 产物供原 `flash.cfg` 使用；Flash 分区变化会触发重新链接。
+`CMakeLists.txt` 直接维护，`cmake/bootloader_sources.cmake` 显式列出需要的生产源文件，不再使用 `CMakeLists_template.txt`。
+CLion 的共享 Debug Profile 将构建目录设为 `cmake-build-debug`；打开项目后重新加载 CMake，选择 Debug 配置即可点击编译。
+构建目录由 CLion Profile 或命令行 `-B` 指定；未指定构建类型时默认为 Debug。
+ELF、HEX、BIN、MAP 和 CMake 中间文件都位于 `cmake-build-debug`，主机测试产物位于其 `tests` 子目录。
+`flash.cfg` 使用该目录中的 ELF；Flash 分区变化会触发重新链接。
 CubeMX 重新生成后需要保留 Bootloader 的精简入口、CS 高电平和 16 KiB 链接限制。
+继续使用现有 `CMakeLists.txt` 构建，避免通过 CLion 的 STM32CubeMX 转换操作重新生成并覆盖手工维护的 CMake 配置。
 
 主机测试覆盖硬件 CRC 模型、外部记录各字段/两层 CRC、奇数长度与跨块处理、最大 384 KiB，
 缺失设备、候选读取失败、安装中读取失败、Flash 错误、消费失败和全部 27 个擦写断电点。

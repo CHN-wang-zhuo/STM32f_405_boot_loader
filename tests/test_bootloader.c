@@ -1,6 +1,5 @@
 /* Native host test of the production core, using a NOR Flash model.
- * gcc -std=c11 -Wall -Wextra -Werror -ICore/Inc tests/test_bootloader.c
- *     Core/Src/bootloader.c -o build/test_bootloader.exe
+ * Run with ./tests/run_tests.ps1; binaries go to cmake-build-debug/tests.
  */
 #include "bootloader.h"
 #include "boot_port.h"
