@@ -4,6 +4,7 @@
  */
 #include "bootloader.h"
 #include "boot_port.h"
+#include "boot_update_storage.h"
 #include <assert.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -103,6 +104,15 @@ static void TestCrcHardwareCompatibility(void)
     puts("PASS: hardware CRC model matches ISO-HDLC for 2068 length/alignment cases");
 }
 
+static uint8_t external[BOOT_STORAGE_SIZE];
+static uint8_t external_saved[BOOT_STORAGE_SIZE];
+static bool storage_open;
+static bool storage_present;
+static bool fail_consume;
+static bool fail_install_read;
+static unsigned read_count;
+static unsigned fail_read_at;
+
 static uint8_t *At(uint32_t address)
 {
     assert(address >= BOOT_FLASH_BASE && address < BOOT_FLASH_BASE + BOOT_FLASH_SIZE);
@@ -112,14 +122,37 @@ static uint8_t *At(uint32_t address)
 const void *BootPort_Map(uint32_t address) { return At(address); }
 bool BootPort_Unlock(void) { unlocked = !fail_unlock; return unlocked; }
 void BootPort_Lock(void) { unlocked = false; }
+bool BootPort_StorageInit(void) { storage_open = storage_present; return storage_open; }
+void BootPort_StorageDeInit(void) { storage_open = false; }
+
+bool BootPort_StorageRead(uint32_t offset, void *data, uint32_t size)
+{
+    assert(storage_open && offset <= BOOT_STORAGE_SIZE && size <= BOOT_STORAGE_SIZE - offset);
+    ++read_count;
+    if (read_count == fail_read_at || (fail_install_read && erases != 0U)) { return false; }
+    memcpy(data, external + offset, size);
+    return true;
+}
 
 static void Cut(void)
 {
     if (++operation == cut_at)
     {
-        unlocked = false;
+        unlocked = storage_open = false;
         longjmp(reset_point, 1);
     }
+}
+
+bool BootPort_StorageConsume(void)
+{
+    BootImageManifest installed;
+    memcpy(&installed, At(BOOT_INSTALLED_ADDRESS), sizeof(installed));
+    assert(storage_open && !unlocked && Boot_ImageValid(BOOT_APP_ADDRESS, &installed));
+    if (fail_consume) { return false; }
+    memset(external + 28U, 0, 2U);
+    Cut();
+    memset(external + 28U, 0, 4U);
+    return true;
 }
 
 static bool Erase(uint32_t address, uint32_t size)
@@ -127,7 +160,7 @@ static bool Erase(uint32_t address, uint32_t size)
     assert(unlocked);
     ++erases;
     memset(At(address), 0xFF, size / 2U);
-    Cut(); /* reset partway through erasing a sector/range */
+    Cut();
     if (fail_erase) { return false; }
     memset(At(address + size / 2U), 0xFF, size / 2U);
     return true;
@@ -140,14 +173,13 @@ bool BootPort_ProgramWord(uint32_t address, uint32_t value)
 {
     const bool allowed = (address >= BOOT_APP_ADDRESS &&
                           address < BOOT_APP_ADDRESS + BOOT_IMAGE_CAPACITY) ||
-                         (address >= BOOT_INSTALLED_ADDRESS && address < BOOT_INSTALLED_ADDRESS + 28U) ||
-                         (address == BOOT_REQUEST_ADDRESS + 28U && value == 0U);
+                         (address >= BOOT_INSTALLED_ADDRESS && address < BOOT_INSTALLED_ADDRESS + 28U);
     assert(unlocked && allowed && (address & 3U) == 0U);
     uint32_t old;
     memcpy(&old, At(address), 4U);
-    assert((old & value) == value); /* NOR cannot change 0 back to 1 */
+    assert((old & value) == value);
     memcpy(At(address), &value, 2U);
-    Cut(); /* includes a torn commit / consumed marker */
+    Cut();
     if (fail_program) { return false; }
     memcpy(At(address), &value, 4U);
     return true;
@@ -156,234 +188,237 @@ bool BootPort_ProgramWord(uint32_t address, uint32_t value)
 static BootImageManifest Manifest(const uint8_t *image, uint32_t size, uint32_t version)
 {
     BootImageManifest m = {BOOT_IMAGE_MAGIC, BOOT_IMAGE_FORMAT, size,
-                           Boot_Crc32(image, size), version, 0U,
+                           ReferenceCrc32(image, size), version, 0U,
                            BOOT_IMAGE_COMMITTED, BOOT_ERASED_WORD};
-    m.header_crc = Boot_Crc32(&m, 20U);
+    m.header_crc = ReferenceCrc32((const uint8_t *)&m, 20U);
     return m;
+}
+
+static void MetadataCrc(BootUpdateRecord *r)
+{
+    uint8_t bytes[52];
+    memcpy(bytes, r, 24U);
+    memcpy(bytes + 24U, (uint8_t *)r + 28U, 28U);
+    r->metadata_crc = ReferenceCrc32(bytes, sizeof(bytes));
+}
+
+static void StageRecord(uint32_t size, uint32_t mode)
+{
+    BootUpdateRecord r = {0};
+    r.image = Manifest(external + BOOT_STORAGE_IMAGE, size, 2U);
+    r.storage_magic = BOOT_STORAGE_MAGIC;
+    r.layout_version = BOOT_STORAGE_VERSION;
+    r.image_offset = BOOT_STORAGE_IMAGE;
+    r.image_capacity = BOOT_STORAGE_CAPACITY;
+    r.apply_mode = mode;
+    r.reserved = r.reserved_tail = BOOT_ERASED_WORD;
+    MetadataCrc(&r);
+    memcpy(external, &r, sizeof(r));
 }
 
 static void Setup(bool installed)
 {
-    memset(flash, 0xFF, sizeof(flash));
-    /* Sentinels for regions that must never be changed. */
-    memset(At(BOOT_FLASH_BASE), 0x5A, BOOT_LOADER_SIZE);
-    memset(At(0x08004000), 0x3C, 0x4000U); /* sector 1 is now reserved */
-    memset(At(0x08010000), 0xA5, 0x10000U);
-    memset(At(0x080E0000), 0xA5, 0x20000U);
-    operation = cut_at = erases = 0U;
-    unlocked = fail_unlock = fail_program = fail_erase = false;
+    memset(flash, 0x77, sizeof(flash));
+    memset(At(BOOT_INSTALLED_ADDRESS), 0xFF, 0x4000U);
+    memset(At(BOOT_APP_ADDRESS), 0xFF, BOOT_IMAGE_CAPACITY);
+    memset(external, 0xA5, sizeof(external));
+    memset(external, 0xFF, 0x1000U);
+    operation = cut_at = erases = read_count = fail_read_at = 0U;
+    unlocked = storage_open = fail_unlock = fail_program = fail_erase = false;
+    fail_consume = fail_install_read = false;
+    storage_present = true;
     for (unsigned i = 0U; i < sizeof(new_image); ++i) { new_image[i] = (uint8_t)i; }
     const uint32_t vectors[] = {0x20020000U, BOOT_APP_ADDRESS + 9U};
     memcpy(new_image, vectors, sizeof(vectors));
-    memcpy(At(BOOT_STAGE_ADDRESS), new_image, sizeof(new_image));
-    BootImageManifest m = Manifest(new_image, sizeof(new_image), 2U);
-    memcpy(At(BOOT_REQUEST_ADDRESS), &m, sizeof(m));
+    memcpy(external + BOOT_STORAGE_IMAGE, new_image, sizeof(new_image));
+    StageRecord(sizeof(new_image), 0U);
     if (installed)
     {
         uint8_t old_image[sizeof(new_image)];
         memcpy(old_image, new_image, sizeof(old_image));
         old_image[20] ^= 0xFFU;
         memcpy(At(BOOT_APP_ADDRESS), old_image, sizeof(old_image));
-        m = Manifest(old_image, sizeof(old_image), 1U);
+        BootImageManifest m = Manifest(old_image, sizeof(old_image), 1U);
         memcpy(At(BOOT_INSTALLED_ADDRESS), &m, sizeof(m));
     }
+}
+
+static void Snapshot(void)
+{
+    memcpy(saved, flash, sizeof(flash));
+    memcpy(external_saved, external, sizeof(external));
+}
+
+static void CheckProtected(void)
+{
+    assert(memcmp(flash, saved, BOOT_INSTALLED_ADDRESS - BOOT_FLASH_BASE) == 0);
+    assert(memcmp(At(BOOT_INSTALLED_ADDRESS + 0x4000U), saved + 0xC000U, 0x14000U) == 0);
+    assert(memcmp(At(BOOT_APP_ADDRESS + BOOT_IMAGE_CAPACITY), saved + 0x80000U, 0x80000U) == 0);
+    assert(memcmp(external, external_saved, 28U) == 0);
+    assert(memcmp(external + 32U, external_saved + 32U, sizeof(external) - 32U) == 0);
 }
 
 static void CheckInstalled(void)
 {
     BootImageManifest m;
     memcpy(&m, At(BOOT_INSTALLED_ADDRESS), sizeof(m));
-    assert(Boot_ImageValid(BOOT_APP_ADDRESS, &m));
-    assert(m.version == 2U);
+    assert(Boot_ImageValid(BOOT_APP_ADDRESS, &m) && m.version == 2U);
     assert(memcmp(At(BOOT_APP_ADDRESS), new_image, sizeof(new_image)) == 0);
     assert(*At(BOOT_APP_ADDRESS + sizeof(new_image)) == 0xFFU);
-    assert(memcmp(At(BOOT_STAGE_ADDRESS), new_image, sizeof(new_image)) == 0);
-    uint32_t consumed;
-    memcpy(&consumed, At(BOOT_REQUEST_ADDRESS + 28U), 4U);
-    assert(consumed == 0U);
-    assert(!unlocked);
+    assert(!unlocked && !storage_open && !crc_active);
 }
 
 static void TestValidation(void)
 {
     assert(Boot_Crc32("123456789", 9U) == 0xCBF43926U);
-    Setup(false);
-    BootImageManifest m = Manifest(new_image, sizeof(new_image), 2U);
-    assert(Boot_ImageValid(BOOT_STAGE_ADDRESS, &m));
-    m.commit ^= 1U;
-    assert(!Boot_ManifestValid(&m));
-    m.commit ^= 1U;
-    m.image_size = BOOT_IMAGE_CAPACITY + 1U;
-    m.header_crc = Boot_Crc32(&m, 20U);
-    assert(!Boot_ImageValid(BOOT_STAGE_ADDRESS, &m));
-    m.image_size = 7U;
-    m.header_crc = Boot_Crc32(&m, 20U);
-    assert(!Boot_ManifestValid(&m));
-    const uint32_t bad_vectors[][2] = {
-        {0x20020008U, BOOT_APP_ADDRESS + 9U},
-        {0x20000000U, BOOT_APP_ADDRESS + 9U},
-        {0x20000004U, BOOT_APP_ADDRESS + 9U},
-        {0x20020000U, BOOT_STAGE_ADDRESS + 9U},
-        {0x20020000U, BOOT_APP_ADDRESS + 8U},
-        {0x20020000U, BOOT_APP_ADDRESS + 0x100U}
-    };
-    for (unsigned i = 0U; i < sizeof(bad_vectors) / sizeof(bad_vectors[0]); ++i)
+    const uint32_t bad[][2] = {{0x20020008U, BOOT_APP_ADDRESS + 9U},
+        {0x20000000U, BOOT_APP_ADDRESS + 9U}, {0x20000004U, BOOT_APP_ADDRESS + 9U},
+        {0x20020000U, BOOT_STAGE_ADDRESS + 9U}, {0x20020000U, BOOT_APP_ADDRESS + 8U},
+        {0x20020000U, BOOT_APP_ADDRESS + 0x100U}};
+    for (unsigned i = 0U; i < sizeof(bad) / sizeof(bad[0]); ++i)
     {
-        memcpy(At(BOOT_STAGE_ADDRESS), bad_vectors[i], 8U);
-        m = Manifest(At(BOOT_STAGE_ADDRESS), sizeof(new_image), 2U);
-        assert(!Boot_ImageValid(BOOT_STAGE_ADDRESS, &m));
+        Setup(true);
+        memcpy(external + BOOT_STORAGE_IMAGE, bad[i], 8U);
+        StageRecord(sizeof(new_image), 0U);
+        assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U && !storage_open);
     }
-    const uint32_t ccm_vectors[] = {0x10010000U, BOOT_APP_ADDRESS + 9U};
-    memcpy(At(BOOT_STAGE_ADDRESS), ccm_vectors, 8U);
-    m = Manifest(At(BOOT_STAGE_ADDRESS), sizeof(new_image), 2U);
-    assert(Boot_ImageValid(BOOT_STAGE_ADDRESS, &m));
+    const struct { uint32_t offset; uint32_t value; } invalid[] = {
+        {0, 0}, {4, 2}, {8, 7}, {8, BOOT_IMAGE_CAPACITY + 1U}, {12, 0},
+        {20, 0}, {24, BOOT_IMAGE_COMMITTED ^ 1U}, {28, 0}, {28, 0xFFFF0000U},
+        {32, 0}, {36, 2}, {40, 0}, {44, BOOT_IMAGE_CAPACITY + 4U},
+        {48, 2}, {52, 0}, {56, 0}, {60, 0}};
+    for (unsigned i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+    {
+        Setup(true);
+        BootUpdateRecord r;
+        memcpy(&r, external, sizeof(r));
+        memcpy((uint8_t *)&r + invalid[i].offset, &invalid[i].value, 4U);
+        if (invalid[i].offset != 20U) { r.image.header_crc = ReferenceCrc32((uint8_t *)&r, 20U); }
+        if (invalid[i].offset != 56U) { MetadataCrc(&r); }
+        memcpy(external, &r, sizeof(r));
+        Snapshot();
+        assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U && !storage_open);
+        assert(memcmp(flash, saved, sizeof(flash)) == 0);
+        assert(memcmp(external, external_saved, sizeof(external)) == 0);
+    }
+    Setup(false);
+    memset(external, 0xFF, 64U);
+    /* A legacy internal staged request must not be used anymore. */
+    BootImageManifest m = Manifest(new_image, sizeof(new_image), 2U);
+    memcpy(At(BOOT_REQUEST_ADDRESS), &m, sizeof(m));
+    memcpy(At(BOOT_STAGE_ADDRESS), new_image, sizeof(new_image));
+    assert(Boot_PrepareApplication() == BOOT_NO_VALID_APP && erases == 0U);
+    puts("PASS: external v1 record validation, vector checks and legacy storage ignored");
 }
 
 static void TestFailures(void)
 {
-    Setup(false);
-    memset(At(BOOT_REQUEST_ADDRESS), 0xFF, 0x4000U);
-    memcpy(At(BOOT_APP_ADDRESS), new_image, sizeof(new_image));
-    assert(Boot_PrepareApplication() == BOOT_NO_VALID_APP); /* no vector-only bypass */
-    assert(erases == 0U);
-
     Setup(true);
-    At(BOOT_STAGE_ADDRESS)[20] ^= 1U;
-    assert(Boot_PrepareApplication() == BOOT_READY); /* preserve old APP */
-    assert(erases == 0U);
-    Setup(true);
-    At(BOOT_REQUEST_ADDRESS)[24] ^= 1U;
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    assert(erases == 0U);
+    storage_present = false;
+    Snapshot();
+    assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U && !storage_open);
+    assert(memcmp(flash, saved, sizeof(flash)) == 0);
     Setup(false);
+    storage_present = false;
+    assert(Boot_PrepareApplication() == BOOT_UPDATE_FAILED && !storage_open);
+    for (unsigned read = 1U; read <= 3U; ++read)
+    {
+        Setup(true);
+        fail_read_at = read;
+        assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U && !storage_open && !crc_active);
+    }
+    Setup(true);
+    external[BOOT_STORAGE_IMAGE + 20U] ^= 1U;
+    assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U);
+    Setup(true);
     fail_unlock = true;
-    assert(Boot_PrepareApplication() == BOOT_UPDATE_FAILED);
-    fail_unlock = false;
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    CheckInstalled();
-
+    assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U);
+    for (unsigned kind = 0U; kind < 3U; ++kind)
+    {
+        Setup(true);
+        fail_program = kind == 0U;
+        fail_erase = kind == 1U;
+        fail_install_read = kind == 2U;
+        Snapshot();
+        assert(Boot_PrepareApplication() == BOOT_UPDATE_FAILED && !storage_open && !unlocked);
+        fail_program = fail_erase = fail_install_read = false;
+        assert(Boot_PrepareApplication() == BOOT_READY);
+        CheckInstalled();
+        CheckProtected();
+    }
     Setup(true);
-    fail_program = true;
-    assert(Boot_PrepareApplication() == BOOT_UPDATE_FAILED);
-    assert(!unlocked);
-    fail_program = false;
+    fail_consume = true;
     assert(Boot_PrepareApplication() == BOOT_READY);
     CheckInstalled();
-
-    Setup(true);
-    fail_erase = true;
-    assert(Boot_PrepareApplication() == BOOT_UPDATE_FAILED);
-    assert(!unlocked);
-    fail_erase = false;
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    CheckInstalled();
+    const unsigned before = erases;
+    fail_consume = false;
+    assert(Boot_PrepareApplication() == BOOT_READY && erases == before);
+    assert(external[28] == 0U);
+    puts("PASS: missing device, SPI failures, Flash failures and acknowledgement retry");
 }
 
 static void TestPowerCuts(void)
 {
     Setup(true);
-    memcpy(saved, flash, sizeof(flash));
+    Snapshot();
     assert(Boot_PrepareApplication() == BOOT_READY);
     const unsigned count = operation;
-    CheckInstalled();
     for (unsigned cut = 1U; cut <= count; ++cut)
     {
         memcpy(flash, saved, sizeof(flash));
-        operation = erases = 0U;
+        memcpy(external, external_saved, sizeof(external));
+        operation = erases = read_count = 0U;
         cut_at = cut;
         if (setjmp(reset_point) == 0)
         {
             (void)Boot_PrepareApplication();
-            assert(!"expected simulated power cut");
+            assert(!"expected power cut");
         }
         cut_at = 0U;
         assert(Boot_PrepareApplication() == BOOT_READY);
         CheckInstalled();
-        assert(memcmp(At(BOOT_FLASH_BASE), saved, BOOT_LOADER_SIZE) == 0);
-        assert(memcmp(At(0x08004000), saved + 0x4000U, 0x4000U) == 0);
-        assert(memcmp(At(0x08010000), saved + 0x10000U, 0x10000U) == 0);
-        assert(memcmp(At(BOOT_STAGE_ADDRESS), saved + 0x80000U, 0x60000U) == 0);
-        assert(memcmp(At(0x080E0000), saved + 0xE0000U, 0x20000U) == 0);
+        CheckProtected();
         const unsigned before = erases;
-        assert(Boot_PrepareApplication() == BOOT_READY);
-        assert(erases == before); /* consumed requests do not reinstall */
+        assert(Boot_PrepareApplication() == BOOT_READY && erases == before);
     }
-    printf("PASS: reset recovery at all %u erase/program operations\n", count);
+    printf("PASS: power loss at all %u internal erase/program + external consume operations\n", count);
 }
 
-static void TestMaximumImage(void)
+static void TestSizes(void)
 {
-    Setup(false);
-    for (uint32_t i = 0U; i < BOOT_IMAGE_CAPACITY; ++i)
+    const uint32_t sizes[] = {9U, 255U, 256U, 257U, 258U, 259U, 1025U, BOOT_IMAGE_CAPACITY};
+    for (unsigned n = 0U; n < sizeof(sizes) / sizeof(sizes[0]); ++n)
     {
-        At(BOOT_STAGE_ADDRESS)[i] = (uint8_t)i;
+        Setup(true);
+        for (uint32_t i = sizeof(new_image); i < sizes[n]; ++i)
+        {
+            external[BOOT_STORAGE_IMAGE + i] = (uint8_t)i;
+        }
+        StageRecord(sizes[n], n & 1U);
+        Snapshot();
+        assert(Boot_PrepareApplication() == BOOT_READY && !storage_open && !crc_active);
+        assert(memcmp(At(BOOT_APP_ADDRESS), external + BOOT_STORAGE_IMAGE, sizes[n]) == 0);
+        BootImageManifest installed;
+        memcpy(&installed, At(BOOT_INSTALLED_ADDRESS), sizeof(installed));
+        assert(installed.image_size == sizes[n] && Boot_ImageValid(BOOT_APP_ADDRESS, &installed));
+        CheckProtected();
+        const unsigned before = erases;
+        assert(Boot_PrepareApplication() == BOOT_READY && erases == before);
     }
-    const uint32_t vectors[] = {0x20020000U, BOOT_APP_ADDRESS + BOOT_IMAGE_CAPACITY - 1U};
-    memcpy(At(BOOT_STAGE_ADDRESS), vectors, sizeof(vectors));
-    BootImageManifest m = Manifest(At(BOOT_STAGE_ADDRESS), BOOT_IMAGE_CAPACITY, 3U);
-    memcpy(At(BOOT_REQUEST_ADDRESS), &m, sizeof(m));
-    memcpy(saved, flash, sizeof(flash));
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    assert(Boot_ImageValid(BOOT_APP_ADDRESS, &m));
-    assert(memcmp(At(BOOT_APP_ADDRESS), At(BOOT_STAGE_ADDRESS), BOOT_IMAGE_CAPACITY) == 0);
-    assert(memcmp(At(BOOT_FLASH_BASE), saved, BOOT_LOADER_SIZE) == 0);
-    assert(memcmp(At(0x08004000), saved + 0x4000U, 0x4000U) == 0);
-    assert(memcmp(At(BOOT_STAGE_ADDRESS), saved + 0x80000U, 0x60000U) == 0);
-    assert(memcmp(At(0x080E0000), saved + 0xE0000U, 0x20000U) == 0);
-    puts("PASS: full 384 KiB image and partition boundaries");
+    /* Fail in a later CRC chunk before any internal erase. */
+    Setup(true);
+    StageRecord(1024U, 0U);
+    fail_read_at = 5U;
+    assert(Boot_PrepareApplication() == BOOT_READY && erases == 0U && !crc_active);
+    puts("PASS: odd tails, 256-byte boundaries, both apply modes and maximum 384 KiB");
 }
 
-static void ReadFile(const char *path, void *buffer, size_t size)
-{
-    FILE *file = fopen(path, "rb");
-    assert(file != NULL);
-    assert(fread(buffer, 1U, size, file) == size);
-    assert(fgetc(file) == EOF);
-    assert(!ferror(file));
-    assert(fclose(file) == 0);
-}
-
-static void TestBuiltApplication(const char *image_path, const char *manifest_path)
-{
-    static uint8_t image[BOOT_IMAGE_CAPACITY];
-    BootImageManifest manifest;
-    ReadFile(manifest_path, &manifest, sizeof(manifest));
-    assert(Boot_ManifestValid(&manifest));
-    ReadFile(image_path, image, manifest.image_size);
-
-    /* Use the exact cross-compiled APP and Python-generated metadata. */
-    Setup(false);
-    memset(flash, 0xFF, sizeof(flash));
-    memcpy(At(BOOT_APP_ADDRESS), image, manifest.image_size);
-    memcpy(At(BOOT_INSTALLED_ADDRESS), &manifest, sizeof(manifest));
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    assert(erases == 0U);
-
-    Setup(false);
-    memset(flash, 0xFF, sizeof(flash));
-    memcpy(At(BOOT_STAGE_ADDRESS), image, manifest.image_size);
-    memcpy(At(BOOT_REQUEST_ADDRESS), &manifest, sizeof(manifest));
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    assert(Boot_ImageValid(BOOT_APP_ADDRESS, &manifest));
-    assert(memcmp(At(BOOT_APP_ADDRESS), image, manifest.image_size) == 0);
-    const unsigned before = erases;
-    assert(Boot_PrepareApplication() == BOOT_READY);
-    assert(erases == before);
-    puts("PASS: built APP boots directly and installs from staging without reinstalling on reset");
-}
-
-int main(int argc, char **argv)
+int main(void)
 {
     TestCrcHardwareCompatibility();
     TestValidation();
     TestFailures();
     TestPowerCuts();
-    TestMaximumImage();
-    assert(argc == 1 || argc == 3);
-    if (argc == 3)
-    {
-        TestBuiltApplication(argv[1], argv[2]);
-    }
-    puts("PASS: CRC, vectors, metadata, corrupt image, Flash failures and protected regions");
+    TestSizes();
     return 0;
 }

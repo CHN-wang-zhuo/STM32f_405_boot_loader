@@ -9,11 +9,10 @@ import zlib
 # The C protocol header is shared with packaging; do not duplicate addresses.
 PROTOCOL = {
     name: int(value, 0)
+    for header in ("boot_protocol.h", "boot_update_storage.h")
     for name, value in re.findall(
         r"^#define\s+(BOOT_\w+)\s+UINT32_C\((0x[0-9A-Fa-f]+|[0-9]+)\)",
-        (Path(__file__).resolve().parents[1] / "Core/Inc/boot_protocol.h").read_text(),
-        re.MULTILINE,
-    )
+        (Path(__file__).resolve().parents[1] / "Core/Inc" / header).read_text(), re.MULTILINE)
 }
 APP_ADDRESS = PROTOCOL["BOOT_APP_ADDRESS"]
 IMAGE_CAPACITY = PROTOCOL["BOOT_IMAGE_CAPACITY"]
@@ -64,10 +63,23 @@ def make_hex(segments: list[tuple[int, bytes]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def make_update_record(manifest: bytes, apply_mode: int) -> bytes:
+    """W25Q16 protocol v1: CRC over bytes 0..23 concatenated with 28..55."""
+    if len(manifest) != 32 or apply_mode not in (0, 1):
+        raise ValueError("external record requires a 32-byte manifest and apply mode 0/1")
+    if struct.unpack_from("<I", manifest, 28)[0] != 0xFFFFFFFF:
+        raise ValueError("new external request must have erased consumed field")
+    record = manifest + struct.pack("<6I", PROTOCOL["BOOT_STORAGE_MAGIC"],
+                                    PROTOCOL["BOOT_STORAGE_VERSION"],
+                                    PROTOCOL["BOOT_STORAGE_IMAGE"],
+                                    PROTOCOL["BOOT_STORAGE_CAPACITY"], apply_mode, 0xFFFFFFFF)
+    return record + struct.pack("<II", zlib.crc32(record[:24] + record[28:56]), 0xFFFFFFFF)
+
+
 def installed_segments(image: bytes, manifest: bytes) -> list[tuple[int, bytes]]:
     return [
         (PROTOCOL["BOOT_INSTALLED_ADDRESS"], manifest),
-        # Cancel any stale pending request so it cannot overwrite this APP.
+        # Cancel legacy INTERNAL requests only. External requests need APP ABORT.
         (PROTOCOL["BOOT_REQUEST_ADDRESS"] + 28, struct.pack("<I", PROTOCOL["BOOT_REQUEST_CONSUMED"])),
         (APP_ADDRESS, image),
     ]
@@ -90,12 +102,17 @@ def main() -> None:
     parser.add_argument("--version", type=lambda text: int(text, 0), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--installed-hex", type=Path,
-                        help="APP + installed metadata + cancelled old request, for SWD programming")
+                        help="APP + installed metadata + cancelled legacy internal request, for SWD")
     parser.add_argument("--update-hex", type=Path,
-                        help="staged APP + pending request, for SWD installation testing")
+                        help="obsolete internal staging option; no longer supported")
+    parser.add_argument("--w25q16-record", type=Path,
+                        help="64-byte external request record at W25Q16 offset 0")
+    parser.add_argument("--apply-mode", type=int, choices=(0, 1), default=0)
     parser.add_argument("--bootloader", type=Path, help="raw Bootloader .bin for factory package")
     parser.add_argument("--factory-hex", type=Path, help="Bootloader + installed APP; requires --bootloader")
     args = parser.parse_args()
+    if args.update_hex:
+        parser.error("internal staging is no longer supported; use --w25q16-record")
     if bool(args.bootloader) != bool(args.factory_hex):
         parser.error("--bootloader and --factory-hex must be supplied together")
     try:
@@ -104,11 +121,6 @@ def main() -> None:
         packages = []
         if args.installed_hex:
             packages.append((args.installed_hex, make_hex(installed_segments(image, manifest))))
-        if args.update_hex:
-            packages.append((args.update_hex, make_hex([
-                (PROTOCOL["BOOT_REQUEST_ADDRESS"], manifest),
-                (PROTOCOL["BOOT_STAGE_ADDRESS"], image),
-            ])))
         if args.factory_hex:
             bootloader = args.bootloader.read_bytes()
             validate_bootloader(bootloader)
@@ -117,15 +129,17 @@ def main() -> None:
                 *installed_segments(image, manifest),
             ])))
         args.output.write_bytes(manifest)
+        if args.w25q16_record:
+            args.w25q16_record.write_bytes(make_update_record(manifest, args.apply_mode))
         for path, content in packages:
             path.write_text(content, encoding="ascii")
     except (OSError, ValueError) as error:
         parser.error(str(error))
     _, _, size, crc, version, _, _, _ = struct.unpack("<8I", manifest)
     print(f"size={size}, crc32=0x{crc:08X}, version={version}")
-    print(f"APP: 0x{APP_ADDRESS:08X}; staging: 0x{PROTOCOL['BOOT_STAGE_ADDRESS']:08X}")
-    print(f"manifest: installed 0x{PROTOCOL['BOOT_INSTALLED_ADDRESS']:08X} "
-          f"OR update request 0x{PROTOCOL['BOOT_REQUEST_ADDRESS']:08X}")
+    print(f"APP: 0x{APP_ADDRESS:08X}; installed manifest: 0x{PROTOCOL['BOOT_INSTALLED_ADDRESS']:08X}")
+    print(f"W25Q16 request: offset 0; candidate: offset 0x{PROTOCOL['BOOT_STORAGE_IMAGE']:06X}")
+    print("For SWD APP replacement, cancel any external pending request through APP ABORT first.")
     for path, _ in packages:
         print(f"HEX: {path}")
 

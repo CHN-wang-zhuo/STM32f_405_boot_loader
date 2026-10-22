@@ -7,6 +7,8 @@ set(SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../Core/Src/stm32f4xx_it.c
     ${CMAKE_CURRENT_LIST_DIR}/../Core/Src/bootloader.c
     ${CMAKE_CURRENT_LIST_DIR}/../Core/Src/boot_port_stm32.c
+    ${CMAKE_CURRENT_LIST_DIR}/../Core/Src/boot_spi_stm32.c
+    ${CMAKE_CURRENT_LIST_DIR}/../Core/Src/w25q16.c
     ${CMAKE_CURRENT_LIST_DIR}/../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c
     ${CMAKE_CURRENT_LIST_DIR}/../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_cortex.c
     ${CMAKE_CURRENT_LIST_DIR}/../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_rcc.c

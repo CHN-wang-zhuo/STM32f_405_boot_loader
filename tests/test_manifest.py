@@ -76,14 +76,14 @@ class ManifestTest(unittest.TestCase):
                 sys.executable, "-B", str(Path(module.__file__)), str(root / "app.bin"),
                 "--version", "0x2A", "--output", str(root / "manifest.bin"),
                 "--installed-hex", str(root / "installed.hex"),
-                "--update-hex", str(root / "update.hex"),
+                "--w25q16-record", str(root / "request.bin"), "--apply-mode", "1",
                 "--bootloader", str(root / "boot.bin"),
                 "--factory-hex", str(root / "factory.hex"),
             ], check=True, capture_output=True, text=True)
             manifest = (root / "manifest.bin").read_bytes()
             self.assertEqual(manifest, module.make_manifest(image, 42))
             installed = decode_hex((root / "installed.hex").read_text())
-            update = decode_hex((root / "update.hex").read_text())
+            update = (root / "request.bin").read_bytes()
             factory = decode_hex((root / "factory.hex").read_text())
 
         def region(address, data):
@@ -93,7 +93,12 @@ class ManifestTest(unittest.TestCase):
         expected = region(0x08020000, image) | region(0x08008000, manifest)
         expected |= region(0x0800C01C, bytes(4))
         self.assertEqual(installed, expected)
-        self.assertEqual(update, region(0x08080000, image) | region(0x0800C000, manifest))
+        self.assertEqual(len(update), 64)
+        self.assertEqual(update[:32], manifest)
+        self.assertEqual(struct.unpack_from("<6I", update, 32),
+                         (0x31505557, 1, 0x10000, 0x60000, 1, 0xFFFFFFFF))
+        self.assertEqual(struct.unpack_from("<II", update, 56),
+                         (zlib.crc32(update[:24] + update[28:56]), 0xFFFFFFFF))
         self.assertEqual(factory, region(0x08000000, bootloader) | expected)
 
     def test_invalid_version_and_bootloader(self):
@@ -105,6 +110,27 @@ class ManifestTest(unittest.TestCase):
                        struct.pack("<II", 0x20020000, 0x08000008) + bytes(32)):
             with self.subTest(size=len(loader)), self.assertRaises(ValueError):
                 module.validate_bootloader(loader)
+
+    def test_record_modes_and_consumption(self):
+        app = struct.pack("<II", 0x20020000, 0x08020009) + bytes(32)
+        manifest = module.make_manifest(app, 7)
+        for mode in (0, 1):
+            record = module.make_update_record(manifest, mode)
+            self.assertEqual(struct.unpack_from("<I", record, 48)[0], mode)
+            changed = bytearray(record)
+            changed[28:32] = bytes(4)
+            self.assertNotEqual(struct.unpack_from("<I", changed, 56)[0],
+                                zlib.crc32(changed[:24] + changed[28:56]))
+        for mode in (-1, 2):
+            with self.assertRaises(ValueError):
+                module.make_update_record(manifest, mode)
+
+    def test_legacy_update_hex_rejected(self):
+        result = subprocess.run([sys.executable, "-B", module.__file__, "missing.bin",
+                                 "--version", "1", "--output", "unused.bin",
+                                 "--update-hex", "unused.hex"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("internal staging is no longer supported", result.stderr)
 
     def test_hex_rejects_overlapping_regions(self):
         with self.assertRaises(ValueError):

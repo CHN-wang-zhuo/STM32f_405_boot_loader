@@ -4,9 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* The core only reads mapped Flash and writes the APP / installed metadata /
- * request consumed word. The STM32 implementation enforces those boundaries. */
+/* Map internal Flash only. External offsets must use StorageRead instead.
+ * Internal writes are restricted to APP/installed metadata; the external
+ * driver can only clear the request consumed word and cannot erase anything. */
 const void *BootPort_Map(uint32_t address);
+bool BootPort_StorageInit(void);
+void BootPort_StorageDeInit(void);
+bool BootPort_StorageRead(uint32_t offset, void *data, uint32_t size);
+bool BootPort_StorageConsume(void);
 /* CRC-32 peripheral session, called only from Boot_Crc32 in main context.
  * FeedWord accepts four bytes packed little endian. The port reflects input
  * bits and returns a reflected running CRC, without the final XOR.

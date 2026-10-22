@@ -9,9 +9,9 @@
 #define BOOT_FLASH_SIZE          UINT32_C(0x00100000)
 #define BOOT_LOADER_SIZE         UINT32_C(0x00004000) /* sector 0; sector 1 reserved */
 #define BOOT_INSTALLED_ADDRESS   UINT32_C(0x08008000) /* sector 2 */
-#define BOOT_REQUEST_ADDRESS     UINT32_C(0x0800C000) /* sector 3 */
+#define BOOT_REQUEST_ADDRESS     UINT32_C(0x0800C000) /* legacy; no longer read/written */
 #define BOOT_APP_ADDRESS         UINT32_C(0x08020000) /* sectors 5-7 */
-#define BOOT_STAGE_ADDRESS       UINT32_C(0x08080000) /* sectors 8-10 */
+#define BOOT_STAGE_ADDRESS       UINT32_C(0x08080000) /* legacy; no longer used for staging */
 #define BOOT_IMAGE_CAPACITY      UINT32_C(0x00060000) /* 384 KiB */
 
 #define BOOT_IMAGE_MAGIC         UINT32_C(0x424C4657)

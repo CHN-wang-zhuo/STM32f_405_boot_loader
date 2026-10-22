@@ -1,6 +1,15 @@
 #include "boot_port.h"
 #include "boot_protocol.h"
 #include "stm32f4xx_hal.h"
+#include "w25q16.h"
+
+bool BootPort_StorageInit(void) { return W25Q16_Init(); }
+void BootPort_StorageDeInit(void) { W25Q16_DeInit(); }
+bool BootPort_StorageRead(uint32_t offset, void *data, uint32_t size)
+{
+    return W25Q16_Read(offset, data, size);
+}
+bool BootPort_StorageConsume(void) { return W25Q16_ConsumeRequest(); }
 
 const void *BootPort_Map(uint32_t address)
 {
@@ -71,9 +80,7 @@ bool BootPort_ProgramWord(uint32_t address, uint32_t value)
     const bool allowed = (address >= BOOT_APP_ADDRESS &&
                           address <= BOOT_APP_ADDRESS + BOOT_IMAGE_CAPACITY - 4U) ||
                          (address >= BOOT_INSTALLED_ADDRESS &&
-                          address < BOOT_INSTALLED_ADDRESS + offsetof(BootImageManifest, consumed)) ||
-                         (address == BOOT_REQUEST_ADDRESS + offsetof(BootImageManifest, consumed) &&
-                          value == BOOT_REQUEST_CONSUMED);
+                          address < BOOT_INSTALLED_ADDRESS + offsetof(BootImageManifest, consumed));
     if (!allowed || (address & 3U) != 0U)
     {
         return false;

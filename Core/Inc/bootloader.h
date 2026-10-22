@@ -16,7 +16,7 @@ typedef enum
 uint32_t Boot_Crc32(const void *data, uint32_t size);
 bool Boot_ManifestValid(const BootImageManifest *manifest);
 bool Boot_ImageValid(uint32_t storage_address, const BootImageManifest *manifest);
-/* Installs a committed request if present, then verifies the installed APP.
+/* Installs a W25Q16 v1 request if present, then verifies the internal APP.
  * Does not download data. Call from main with HAL time base running. */
 BootStatus Boot_PrepareApplication(void);
 
