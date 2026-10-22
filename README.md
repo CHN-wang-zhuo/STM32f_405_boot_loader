@@ -26,20 +26,22 @@ APP 负责下载固件并提交升级请求，Bootloader 负责校验、安装�
 CubeMX 的 GPIO 配置也已同步为 CS 初始高电平；生成的 `spi.c`、`gpio.c`、HAL SPI 和 DMA 驱动不参与 CMake 构建。
 W25Q16 的电源应匹配具体型号后缀，标准 SPI 的 /WP、/HOLD 应保持高电平。
 
-## 内部 Flash 分区
+## 内部 Flash：Bootloader、APP 与安装描述信息
 
-维持现有 APP 协议的地址和容量，没有扩大 APP 分区。
+内部 Flash 仍用于存放和执行 Bootloader、APP，并保存已安装 APP 的描述信息。
+W25Q16 只暂存待升级固件：Bootloader 通过 SPI1 读取、校验后，将其写入内部 APP 运行区，再跳转执行。
+改用外部暂存后，旧内部升级请求区和固件暂存区已停用，APP 的运行地址和容量保持不变。
 
-| 区域 | 扇区 | 起始地址 | 大小 |
-| --- | --- | --- | --- |
-| Bootloader | 0 | `0x08000000` | 16 KiB |
-| 保留 | 1 | `0x08004000` | 16 KiB |
-| 已安装 APP 的描述信息 | 2 | `0x08008000` | 16 KiB |
-| 旧内部升级请求，当前忽略 | 3 | `0x0800C000` | 16 KiB |
-| 保留 | 4 | `0x08010000` | 64 KiB |
-| APP 运行区 | 5–7 | `0x08020000` | 384 KiB |
-| 原内部暂存区，当前不读写 | 8–10 | `0x08080000` | 384 KiB |
-| 保留 | 11 | `0x080E0000` | 128 KiB |
+| 区域 | 扇区 | 起始地址 | 大小 | 当前用途 |
+| --- | --- | --- | --- | --- |
+| Bootloader | 0 | `0x08000000` | 16 KiB | 存放并执行启动、校验和安装程序 |
+| 保留 | 1 | `0x08004000` | 16 KiB | 未使用 |
+| 已安装 APP 的描述信息 | 2 | `0x08008000` | 16 KiB | 保存长度、CRC、版本及提交标记 |
+| 保留（旧内部升级请求区） | 3 | `0x0800C000` | 16 KiB | Bootloader 不再使用 |
+| 保留 | 4 | `0x08010000` | 64 KiB | 未使用 |
+| APP 运行区 | 5–7 | `0x08020000` | 384 KiB | 安装并执行 APP |
+| 保留（旧内部固件暂存区） | 8–10 | `0x08080000` | 384 KiB | Bootloader 不再使用 |
+| 保留 | 11 | `0x080E0000` | 128 KiB | 未使用 |
 
 Bootloader 链接脚本限制为 `0x08000000`–`0x08003FFF`，超过 16 KiB 会链接失败。
 内部 Flash 只允许擦写 sector 2 和 sectors 5–7；不再读写旧内部请求或暂存区。
@@ -99,7 +101,34 @@ CRC 始终是 CRC-32/ISO-HDLC，与 Python `zlib.crc32()` 一致；`123456789` �
 完整 32 位字通过硬件 CRC 和 RBIT 处理，跨 SPI 块连续累计，最后 0–3 字节软件续算；不将外部固件整体读入 RAM。
 CRC 由主循环独占，不在中断中调用。版本号不要求递增；没有签名认证、试运行确认或自动回滚。
 
-## APP 与首次烧录
+## 烧录 Bootloader
+
+使用 ST-Link，通过 SWD 连接并给开发板供电，BOOT0 保持低电平：
+
+| ST-Link 信号 | 开发板连接 |
+| --- | --- |
+| SWDIO | PA13 |
+| SWCLK | PA14 |
+| GND | GND |
+| VTref | 板上 3.3 V，用于目标电压参考 |
+| NRST（可选） | NRST |
+
+在 CLion 中重新加载 CMake，选择 Debug Profile 和 `stm32f405_boot_loader.elf` 对应的 **OpenOCD 下载并运行** 配置，然后点击运行。
+运行配置会先编译再烧录；仅点击编译只生成固件文件。
+现有 `flash.cfg` 指向本机工程的 ELF 绝对路径，移动工程或在其他电脑上使用时，应同步调整该路径及 OpenOCD 运行配置。
+
+也可以在工程根目录的 PowerShell 中使用相对路径烧录：
+
+```powershell
+cmake --build cmake-build-debug
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program {cmake-build-debug/stm32f405_boot_loader.elf} verify reset exit"
+```
+
+需要先将 ARM GCC、CMake、Ninja 和 OpenOCD 加入 PATH，并安装 ST-Link 驱动。
+OpenOCD 按 ELF 中的地址烧录 Bootloader，随后校验并复位，不执行全片擦除。
+烧录文件位于第 0 扇区；复位后，Bootloader 会检查 W25Q16，存在有效升级请求时按安装流程更新 APP。
+
+## APP 配置、首次安装与后续升级
 
 APP 保持原有链接配置：
 
@@ -111,17 +140,32 @@ APP 的 `SystemInit()` 应将 VTOR 设置为 `0x08020000`。
 同款 Cube 系统文件可以在 APP 构建时定义 `USER_VECT_TAB_ADDRESS` 和 `VECT_TAB_OFFSET=0x00020000U`。
 APP 自行初始化时钟和外设，下载并提交外部请求的行为保持原协议。
 
-现有打包工具仍支持直接 SWD 安装和工厂组合包：
+空白芯片首次使用时，推荐生成包含 Bootloader、APP 和已安装描述信息的工厂组合包。
+已有 Bootloader 时，可以单独生成 APP 安装包。将为 `0x08020000` 链接的 APP 原始 BIN 准备为 `app.bin`，在本工程根目录执行：
 
 ```powershell
 python -B tools/make_manifest.py app.bin --version 1 --output app.manifest.bin --installed-hex APP.installed.hex
 python -B tools/make_manifest.py app.bin --version 1 --output app.manifest.bin --bootloader cmake-build-debug/stm32f405_boot_loader.bin --factory-hex factory.hex
 ```
 
+选择需要的 HEX 包，通过 SWD 烧录（以下两个命令按需选择一个）：
+
+```powershell
+# 安装或替换 APP，保留已有 Bootloader
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program {APP.installed.hex} verify reset exit"
+# 首次烧录 Bootloader 与 APP 组合包
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program {factory.hex} verify reset exit"
+```
+
 直接烧录 APP 时，将 APP BIN 写入 `0x08020000`，32 字节已安装描述信息写入 `0x08008000`。
 工具仍会清除旧内部请求的消费标记，以兼容旧版部署流程；**它不能清除 W25Q16 中的待升级请求**。
 如果外部已有待升级包，应先通过现有 APP 的 ABORT 取消，或使用外部 Flash 编程器擦除请求扇区，避免复位后安装另一个候选包。
-首次装机也可以通过 APP 协议准备 W25Q16 候选包，再复位让 Bootloader 安装。
+
+仅烧录 Bootloader、内部没有有效 APP 且 W25Q16 没有有效候选包时，程序会进入 `Error_Handler()` 等待调试。
+Bootloader 不提供下载服务；通过 APP 下载固件的前提是已有可运行的 APP。
+后续升级流程为：由 [APP 项目](https://github.com/CHN-wang-zhuo/STM32f_405_FreeRTOS) 下载新固件到 W25Q16 的 `0x010000`，
+完成校验后在偏移 `0x000000` 提交有效升级记录，再复位，由 Bootloader 安装并启动 APP。
+空白芯片也可以使用外部 Flash 编程器先准备候选固件和有效记录，再由 Bootloader 安装。
 
 需要生成外部记录用于检查或编程器测试时：
 
@@ -155,4 +199,18 @@ CubeMX 重新生成后需要保留 Bootloader 的精简入口、CS 高电平和 
 SPI 寄存器测试链接生产轮询代码，检查 Mode 0、8 位传输、禁用 DMA/中断、GPIO 复用、MODF/OVR 和计时回绕。
 测试同时检查 Bootloader、保留区、旧内部请求和暂存区，以及外部候选包/保留区未被修改。
 
-主机测试和编译不能代替实板验证；还需核对 JEDEC、SPI 波形、真实读写/断电重试及 APP 跳转。本次未执行烧录。
+### 实板验证记录（2026-10-22）
+
+已通过 ST-Link 烧录当前 Debug Bootloader，并由 OpenOCD 校验成功。该构建占用 Flash 5444 字节，链接器报告 RAM 占用 2040 字节。
+
+| 检查项 | 实测结果 |
+| --- | --- |
+| SPI1 识别 W25Q16 | `g_w25q16_jedec_id = 0xEF4015` |
+| Bootloader 启动结果 | `boot_status = BOOT_READY`，到达 APP 跳转入口 |
+| APP 接管中断向量 | `SCB->VTOR = 0x08020000` |
+| APP 运行位置 | PC 位于 APP 运行区，采样值为 `0x0802363E` |
+| 已安装 APP 描述信息 | 版本 2，烧录 Bootloader 前后内容一致 |
+
+上述结果确认了 Bootloader 烧录、外部芯片识别、已有 APP 校验和跳转。
+尚未通过实板验证新候选固件的完整搬运、消费标记写入及安装期间断电恢复；SPI 波形也尚未测量。
+这些安装和故障恢复路径已有主机模型测试覆盖，仍需使用真实新固件及硬件进行验证。
